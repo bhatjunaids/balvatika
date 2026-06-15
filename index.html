@@ -196,6 +196,10 @@
   thead th.sorted .arrow{opacity:1;color:var(--spine-deep)}
   thead th.col-dist{text-align:left;left:0;z-index:4;min-width:160px}
   thead th.col-over{text-align:left}
+  thead th.col-scan{text-align:left;min-width:104px}
+  td.col-scan{text-align:left;font-family:var(--sans);font-weight:500;color:var(--ink-soft);font-size:12px;font-variant-numeric:tabular-nums}
+  td.col-scan .scan-val{color:var(--ink)}
+  td.col-scan .scan-na{color:var(--ink-faint)}
   td{padding:9px 10px;border-bottom:1px solid var(--line-soft);text-align:right;font-family:var(--mono);white-space:nowrap}
   tr:last-child td{border-bottom:none}
   td.col-dist{
@@ -690,10 +694,20 @@ function ingest(rows){
   }
   const matchedTitleKeys=Object.values(colToTitle);
 
+  // find a scan-date column: a non-district, non-title column whose header
+  // mentions date / scan / received / timestamp. First such column wins.
+  let dateCol=-1;
+  for(let c=0;c<header.length;c++){
+    if(c===distCol || colToTitle[c]) continue;
+    const h=normTitle(header[c]);
+    if(/(scandate|scandatetime|date|datetime|timestamp|receiveddate|recddate|scannedon|receivedon)/.test(h)){ dateCol=c; break; }
+  }
+
   // aggregate received per district
   const received={};            // canonicalName -> {key:val}
   const seenDistricts=new Set();
   const unmatchedDistricts=new Set();
+  const scanRaw={};             // canonicalName -> {raw, t}  (keep the latest date seen)
   for(const r of dataRows){
     const canon=matchDistrict(r[distCol]);
     if(!canon){ if(String(r[distCol]||"").trim()) unmatchedDistricts.add(String(r[distCol]).trim()); continue; }
@@ -703,13 +717,23 @@ function ingest(rows){
       const key=colToTitle[c];
       received[canon][key]=(received[canon][key]||0)+toNum(r[c]);
     }
+    if(dateCol>-1){
+      const dv=String(r[dateCol]||"").trim();
+      if(dv){
+        const d=parseDateVal(dv);
+        const t=d?d.getTime():-Infinity;
+        if(!scanRaw[canon] || t>scanRaw[canon].t) scanRaw[canon]={raw:dv,t};
+      }
+    }
   }
+  const scanDate={};            // canonicalName -> raw date string
+  for(const k in scanRaw) scanDate[k]=scanRaw[k].raw;
 
-  const unmatchedTitles=header.filter((h,c)=>c!==distCol && !colToTitle[c] && String(h).trim()!=="");
+  const unmatchedTitles=header.filter((h,c)=>c!==distCol && c!==dateCol && !colToTitle[c] && String(h).trim()!=="");
 
   return {
     received, seenDistricts,
-    matchedTitleKeys,
+    matchedTitleKeys, scanDate, hasDateCol:dateCol>-1,
     unmatchedDistricts:[...unmatchedDistricts],
     unmatchedTitles
   };
@@ -721,6 +745,22 @@ let sortKey="sn", sortDir=1;
 let activeFilter="all", searchTerm="";
 
 function fmt(n){ return n.toLocaleString("en-IN"); }
+/* Parse the many date shapes a sheet/CSV can throw at us, day-first (Indian) */
+function parseDateVal(v){
+  v=String(v||"").trim();
+  if(!v) return null;
+  let m=v.match(/^Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)$/); // gviz Date(y,m0,d,...)
+  if(m) return new Date(+m[1],+m[2],+m[3],+(m[4]||0),+(m[5]||0),+(m[6]||0));
+  m=v.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);            // DD/MM/YYYY (day-first)
+  if(m){ let y=+m[3]; if(y<100) y+=2000; const dt=new Date(y,+m[2]-1,+m[1]); if(!isNaN(dt)) return dt; }
+  const dt=new Date(v);
+  return isNaN(dt)?null:dt;
+}
+function fmtDate(v){
+  if(!v) return "";
+  const d=parseDateVal(v);
+  return d ? d.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}) : String(v);
+}
 function compact(n){
   if(n>=1e7) return (n/1e7).toFixed(2).replace(/\.00$/,"")+" Cr";
   if(n>=1e5) return (n/1e5).toFixed(2).replace(/\.00$/,"")+" L";
@@ -746,6 +786,7 @@ function computeRows(){
     const pct = d.targetTotal? (recTotal/d.targetTotal*100) : 0;
     const row={ ...d, rec, recTotal, pct };
     row.inFile = !!(STATE && STATE.seenDistricts.has(d.name));
+    row.scanDate = (STATE && STATE.scanDate) ? (STATE.scanDate[d.name]||"") : "";
     row.status = statusOf(row);
     return row;
   });
@@ -833,6 +874,10 @@ function renderTable(rows){
     if(sortKey==="sn"){av=a.sn;bv=b.sn;}
     else if(sortKey==="name"){av=a.name;bv=b.name;}
     else if(sortKey==="over"){av=a.pct;bv=b.pct;}
+    else if(sortKey==="scan"){
+      const ad=parseDateVal(a.scanDate), bd=parseDateVal(b.scanDate);
+      av=ad?ad.getTime():-Infinity; bv=bd?bd.getTime():-Infinity;
+    }
     else { // a title key
       const at=a.target[sortKey], bt=b.target[sortKey];
       av=at?a.rec[sortKey]/at:0; bv=bt?b.rec[sortKey]/bt:0;
@@ -845,7 +890,8 @@ function renderTable(rows){
 
   let head=`<tr>
     <th class="col-dist ${cls('name')}" data-sort="name">District<span class="arrow">${arrow('name')||arrow('sn')}</span></th>
-    <th class="col-over ${cls('over')}" data-sort="over">Overall<span class="arrow">${arrow('over')}</span></th>`;
+    <th class="col-over ${cls('over')}" data-sort="over">Overall<span class="arrow">${arrow('over')}</span></th>
+    <th class="col-scan ${cls('scan')}" data-sort="scan">Scan date<span class="arrow">${arrow('scan')}</span></th>`;
   TITLES.forEach(t=>{ head+=`<th class="${cls(t.key)}" data-sort="${t.key}" title="${t.label}">${t.short||t.label}<span class="arrow">${arrow(t.key)}</span></th>`; });
   head+=`<th>Status</th></tr>`;
 
@@ -871,9 +917,15 @@ function renderTable(rows){
     const overInner = hasData
       ? `<div class="bar"><i style="width:${Math.min(100,r.pct)}%;background:${overCol}"></i></div><span class="overpct">${r.pct>999?"999+":r.pct.toFixed(0)}%</span>`
       : `<div class="bar"></div><span class="overpct" style="color:var(--ink-faint)">—</span>`;
+    const scanCell = hasData
+      ? (r.scanDate
+          ? `<span class="scan-val" title="${r.scanDate}">${fmtDate(r.scanDate)}</span>`
+          : `<span class="scan-na">—</span>`)
+      : `<span class="scan-na">—</span>`;
     body+=`<tr class="${loaded?'clk':''}" data-sn="${r.sn}">
       <td class="col-dist"><span class="sn">${String(r.sn).padStart(2,'0')}</span>${r.name}${loaded?'<span class="dchev">view ›</span>':''}</td>
       <td><div class="overcell">${overInner}</div></td>
+      <td class="col-scan">${scanCell}</td>
       ${cells}
       <td><span class="badge-st ${meta.cls}">${meta.label}</span></td>
     </tr>`;
@@ -909,7 +961,8 @@ function openDetail(sn){
   pctEl.textContent=(r.pct>999?"999+":r.pct.toFixed(1))+"%";
   pctEl.style.color=meta.color;
   document.getElementById("drSub").innerHTML=
-    `${fmt(r.recTotal)} of ${fmt(r.targetTotal)} books · <span style="color:${meta.color}">${meta.label}</span>`;
+    `${fmt(r.recTotal)} of ${fmt(r.targetTotal)} books · <span style="color:${meta.color}">${meta.label}</span>`
+    + (r.scanDate ? ` · scanned ${fmtDate(r.scanDate)}` : ``);
 
   let rows="";
   TITLES.forEach(t=>{
@@ -1224,7 +1277,7 @@ function loadDemo(){
   stopLive(); renderSource("idle");
   // deterministic pseudo-random
   let seed=42; const rnd=()=>{ seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff; };
-  const received={}; const seen=new Set();
+  const received={}; const seen=new Set(); const scanDate={};
   DISTRICTS.forEach((d,i)=>{
     const roll=rnd();
     if(roll<0.08){ return; }                 // ~no report
@@ -1239,8 +1292,14 @@ function loadDemo(){
       const noise=base*(0.85+rnd()*0.3);
       received[d.name][t.key]=Math.max(0,Math.round(d.target[t.key]*Math.min(noise, base===0?0:1.15)));
     });
+    // synthetic scan date in May–Jun 2026 (only for districts with material)
+    if(base>0){
+      const day=1+Math.floor(rnd()*45);       // 1..45 days from 1 May
+      const dt=new Date(2026,4,1); dt.setDate(dt.getDate()+day);
+      scanDate[d.name]=`${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
+    }
   });
-  STATE={ received, seenDistricts:seen, matchedTitleKeys:TITLES.map(t=>t.key),
+  STATE={ received, seenDistricts:seen, matchedTitleKeys:TITLES.map(t=>t.key), scanDate, hasDateCol:true,
           unmatchedDistricts:[], unmatchedTitles:[] };
   const el=document.getElementById("matchReport");
   el.classList.add("show");
@@ -1252,11 +1311,11 @@ function loadDemo(){
 function exportCSV(){
   const rows=computeRows();
   const loaded=!!STATE;
-  const head=["Sl. No.","District","In File","Status","Overall Target","Overall Received","Overall %"];
+  const head=["Sl. No.","District","Scan Date","In File","Status","Overall Target","Overall Received","Overall %"];
   TITLES.forEach(t=>{ head.push(`${t.label} Target`,`${t.label} Received`,`${t.label} %`); });
   const lines=[head.join(",")];
   rows.forEach(r=>{
-    const cells=[r.sn, `"${r.name}"`, loaded?(r.inFile?"Yes":"No"):"", STATUS_META[r.status].label, r.targetTotal,
+    const cells=[r.sn, `"${r.name}"`, loaded?`"${fmtDate(r.scanDate)}"`:"", loaded?(r.inFile?"Yes":"No"):"", STATUS_META[r.status].label, r.targetTotal,
                  loaded?r.recTotal:"", loaded?r.pct.toFixed(1):""];
     TITLES.forEach(t=>{
       const tgt=r.target[t.key];
